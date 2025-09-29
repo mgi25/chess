@@ -1,759 +1,585 @@
-# Swiss League Web App — Single‑file Flask app
-import csv
-import io
-import math
-import os
-import re
-from dataclasses import dataclass
-from datetime import datetime
-from typing import Dict, List, Optional, Tuple
+from __future__ import annotations
 
-from flask import Flask, request, redirect, url_for, render_template, send_file, flash
-from sqlalchemy import (Column, Integer, String, Boolean, DateTime, ForeignKey,
-                        create_engine, UniqueConstraint, func)
-from sqlalchemy.orm import declarative_base, relationship, sessionmaker, scoped_session
-import pandas as pd
-import xlsxwriter
-from jinja2 import DictLoader
-from openpyxl import load_workbook
-
-# - Auto standings with tiebreaks (Buchholz, Sonneborn‑Berger, wins)
-# - Export snapshot to XLSX with multiple sheets (Players, Rounds, Standings)
-# - Looks/behaves like a clean, grid‑first “Excel sheet” but in the browser
-#
-# Quick start
-# 1) pip install -r requirements.txt
-#    (Flask, SQLAlchemy, pandas, xlsxwriter)
-# 2) python app.py
-# 3) Open http://127.0.0.1:5000
-#
-# NOTE: This is a pragmatic Swiss pairing engine that satisfies common
-# tournament needs. For FIDE‑strict edge cases you may need deeper constraints
-# (forbidden pair lists, floaters across multiple rounds, fine‑grained color
-# history rules, accelerated pairings, etc.). Those can be added in the
-# `make_swiss_pairings()` function.
-# -----------------------------------------------------------
-
-from __future__ import annotations
-import csv
-import io
-import math
-import os
-import statistics
-from dataclasses import dataclass
-from datetime import datetime
-from typing import Dict, List, Optional, Tuple
-
-from flask import Flask, request, redirect, url_for, render_template_string, send_file, flash
-from sqlalchemy import (Column, Integer, String, Boolean, DateTime, ForeignKey,
-                        create_engine, UniqueConstraint, func)
-from sqlalchemy.orm import declarative_base, relationship, sessionmaker, scoped_session
-import pandas as pd
-import xlsxwriter
-
-# ---------------------------------
-# Flask / DB setup
-# ---------------------------------
-app = Flask(__name__)
-app.secret_key = os.environ.get("SECRET_KEY", "dev-key")
-
-DB_URL = os.environ.get("DATABASE_URL", "sqlite:///swiss.db")
-engine = create_engine(DB_URL, echo=False, future=True)
-SessionLocal = scoped_session(sessionmaker(bind=engine))
-Base = declarative_base()
-
-
-# ---------------------------------
-# Models
-# ---------------------------------
-class Player(Base):
-    __tablename__ = "players"
-    id = Column(Integer, primary_key=True)
-    name = Column(String, nullable=False)
-    rating = Column(Integer, default=1200)
-    club = Column(String, default="")
-    bye_count = Column(Integer, default=0)
-
-    def __repr__(self):
-        return f"<Player {self.id} {self.name} ({self.rating})>"
-
-
-class Round(Base):
-    __tablename__ = "rounds"
-    id = Column(Integer, primary_key=True)
-    number = Column(Integer, nullable=False, unique=True)def tiebreaks(sess) -> Dict[int, Dict[str, float]]:
-    """Calculate Buchholz and Sonneborn‑Berger for each player."""
-    scores = get_scores(sess)
-    om = opponents_map(sess)
-    return {pid: {"buchholz": buchholz[pid], "sb": sb[pid]} for pid in scores}
+from flask import Flask, flash, redirect, render_template, request, send_file, url_for
+from sqlalchemy import (
+    Boolean,
+    Column,
+    DateTime,
+    ForeignKey,
+    Integer,
+    String,
+    UniqueConstraint,
+    create_engine,
+    func,
+)
+from sqlalchemy.orm import declarative_base, relationship, scoped_session, sessionmaker, selectinload
 
 
-def safe_rating(value, default: int = 1200) -> int:
-    try:
-        if value is None:
-            return default
-        if isinstance(value, (int, float)):
-            if isinstance(value, float) and math.isnan(value):
-                return default
-            return int(round(float(value)))
-        text = str(value).strip()
-        if not text:
-            return default
-        return int(round(float(text)))
-    except (ValueError, TypeError):
-        return default
+# ---------------------------------------------------------------------------
+# Flask / SQLAlchemy setup
+# ---------------------------------------------------------------------------
+app = Flask(__name__)
+app.secret_key = os.environ.get("SECRET_KEY", "dev-key")
+
+DB_URL = os.environ.get("DATABASE_URL", "sqlite:///swiss.db")
+engine = create_engine(DB_URL, echo=False, future=True)
+SessionLocal = scoped_session(sessionmaker(bind=engine, autoflush=False))
+Base = declarative_base()
 
 
-def parse_bool_cell(value) -> bool:
-    if isinstance(value, bool):
-        return value
-    if value is None:
-        return False
-    if isinstance(value, (int, float)):
-        return value != 0
-    text = str(value).strip().lower()
-    return text in {"1", "true", "yes", "y", "finished", "done", "x", "✓"}
+# ---------------------------------------------------------------------------
+# Models
+# ---------------------------------------------------------------------------
+class Player(Base):
+    __tablename__ = "players"
 
+    id = Column(Integer, primary_key=True)
+    name = Column(String, nullable=False)
+    rating = Column(Integer, default=1200)
+    club = Column(String, default="")
+    bye_count = Column(Integer, default=0)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
 
-def normalize_result(value) -> str:
-    if value is None:
-        return "*"
-    text = str(value).strip()
-    if not text:
-        return "*"
-    normalized = (
-        text.lower()
-        .replace(" ", "")
-        .replace("–", "-")
-        .replace("—", "-")
-        .replace("½", "0.5")
+    white_pairings = relationship(
+        "Pairing",
+        primaryjoin="Player.id==Pairing.white_id",
+        back_populates="white",
+        cascade="all,delete",
     )
-    mapping = {
-        "1-0": "1-0",
-        "1:0": "1-0",
-        "0-1": "0-1",
-        "0:1": "0-1",
-        "0.5-0.5": "0.5-0.5",
-        "0.5:0.5": "0.5-0.5",
-        "1/2-1/2": "0.5-0.5",
-        "1/2:1/2": "0.5-0.5",
-        "bye": "BYE",
-    }
-    return mapping.get(normalized, "*")
+    black_pairings = relationship(
+        "Pairing",
+        primaryjoin="Player.id==Pairing.black_id",
+        back_populates="black",
+        cascade="all,delete",
+    )
+
+    def __repr__(self) -> str:  # pragma: no cover - debug helper
+        return f"<Player {self.id} {self.name} ({self.rating})>"
 
 
-def compute_standings(sess) -> List[Dict[str, float]]:
+class Round(Base):
+    __tablename__ = "rounds"
+
+    id = Column(Integer, primary_key=True)
+    number = Column(Integer, nullable=False, unique=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    pairings = relationship("Pairing", back_populates="round", cascade="all,delete")
+
+    def __repr__(self) -> str:  # pragma: no cover - debug helper
+        return f"<Round {self.number}>"
+
+class Pairing(Base):
+    __tablename__ = "pairings"
+    id = Column(Integer, primary_key=True)
+    round_id = Column(Integer, ForeignKey("rounds.id", ondelete="CASCADE"), nullable=False)
+    board_no = Column(Integer, nullable=False)
+    white_id = Column(Integer, ForeignKey("players.id", ondelete="SET NULL"))
+    black_id = Column(Integer, ForeignKey("players.id", ondelete="SET NULL"))
+    result = Column(String, default="*")
+    started = Column(Boolean, default=False)
+    finished = Column(Boolean, default=False)
+
+    round = relationship("Round", back_populates="pairings")
+    white = relationship("Player", foreign_keys=[white_id], back_populates="white_pairings")
+    black = relationship("Player", foreign_keys=[black_id], back_populates="black_pairings")
+
+    __table_args__ = (UniqueConstraint("round_id", "board_no", name="uq_round_board"),)
+
+    def __repr__(self) -> str:  # pragma: no cover - debug helper
+        return (
+            f"<Pairing R{self.round_id} B{self.board_no} {self.white_id} vs "
+            f"{self.black_id} {self.result}>"
+        )
+
+
+Base.metadata.create_all(engine)
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+Result = str
+
+SCORE_MAP: Dict[str, Tuple[float, float]] = {
+    "1-0": (1.0, 0.0),
+    "0-1": (0.0, 1.0),
+    "0.5-0.5": (0.5, 0.5),
+    "BYE": (1.0, 0.0),
+}
+
+ALLOWED_RESULTS = {"*", "1-0", "0-1", "0.5-0.5"}
+
+
+def safe_rating(value: Optional[str], default: int = 1200) -> int:
+def parse_bool_cell(value: object) -> bool:
+    return text in {"1", "true", "yes", "y", "done", "finished", "x", "✓"}
+def normalize_result(value: object) -> str:
+def get_all_rounds(sess) -> List[Round]:
+    return (
+        sess.query(Round)
+        .options(
+            selectinload(Round.pairings).selectinload(Pairing.white),
+            selectinload(Round.pairings).selectinload(Pairing.black),
+        )
+        .order_by(Round.number.asc())
+        .all()
+    )
+
+
+def get_current_round_number(sess) -> int:
+    value = sess.query(func.max(Round.number)).scalar()
+    return int(value or 0)
+
+
+def get_scores(sess) -> Dict[int, float]:
+    scores: Dict[int, float] = {p.id: 0.0 for p in sess.query(Player).all()}
+    for pr in sess.query(Pairing).all():
+        if pr.result not in SCORE_MAP:
+            continue
+        white_score, black_score = SCORE_MAP[pr.result]
+        if pr.white_id is not None:
+            scores[pr.white_id] = scores.get(pr.white_id, 0.0) + white_score
+        if pr.black_id is not None and pr.result != "BYE":
+            scores[pr.black_id] = scores.get(pr.black_id, 0.0) + black_score
+    return scores
+
+
+def get_color_history(sess) -> Dict[int, Tuple[int, int]]:
+    history: Dict[int, Tuple[int, int]] = {p.id: (0, 0) for p in sess.query(Player).all()}
+    for pr in sess.query(Pairing).all():
+        if pr.white_id:
+            w_white, w_black = history.get(pr.white_id, (0, 0))
+            history[pr.white_id] = (w_white + 1, w_black)
+        if pr.black_id:
+            b_white, b_black = history.get(pr.black_id, (0, 0))
+            history[pr.black_id] = (b_white, b_black + 1)
+    return history
+
+
+def opponents_map(sess) -> Dict[int, set]:
+    mapping: Dict[int, set] = {p.id: set() for p in sess.query(Player).all()}
+    for pr in sess.query(Pairing).all():
+        if pr.white_id and pr.black_id:
+            mapping[pr.white_id].add(pr.black_id)
+            mapping[pr.black_id].add(pr.white_id)
+    return mapping
+
+
+def tiebreaks(sess) -> Dict[int, Dict[str, float]]:
     scores = get_scores(sess)
-    tb = tiebreaks(sess)
-    wins: Dict[int, int] = {pid: 0 for pid in scores}
-    for pr in sess.query(Pairing).filter(Pairing.finished == True).all():
-        if pr.result == "1-0":
-            wins[pr.white_id] = wins.get(pr.white_id, 0) + 1
-        elif pr.result == "0-1":
-            wins[pr.black_id] = wins.get(pr.black_id, 0) + 1
-    rows = []
-    for p in sess.query(Player).order_by(Player.id.asc()).all():
-        rows.append({
-            "pid": p.id,
-            "name": p.name,
-            "rating": p.rating,
-            "score": scores.get(p.id, 0.0),
-            "buchholz": tb.get(p.id, {}).get("buchholz", 0.0),
-            "sb": tb.get(p.id, {}).get("sb", 0.0),
-            "wins": wins.get(p.id, 0),
-        })
-    rows.sort(key=lambda r: (-r["score"], -r["buchholz"], -r["sb"], -r["wins"], -r["rating"], r["pid"]))
-    return rows
-@dataclass
-class Seed:
-    pid: int
-    name: str
-    rating: int
-    score: float
-    white_ct: int
-    black_ct: int
-    bye_count: int
+    opponents = opponents_map(sess)
 
-    @property
-    def color_balance(self) -> int:
-        return self.white_ct - self.black_ct  # prefer closer to 0
-    players = sess.query(Player).all()
-    if not players:
+    buchholz: Dict[int, float] = {pid: 0.0 for pid in scores}
+    sb: Dict[int, float] = {pid: 0.0 for pid in scores}
+
+    for pid, opps in opponents.items():
+        buchholz[pid] = sum(scores.get(opp, 0.0) for opp in opps)
+
+    for pr in sess.query(Pairing).filter(Pairing.finished == True).all():  # noqa: E712
+        if pr.white_id is None:
+            continue
+        if pr.result == "1-0" and pr.black_id is not None:
+            sb[pr.white_id] += scores.get(pr.black_id, 0.0)
+        elif pr.result == "0-1" and pr.black_id is not None:
+            sb[pr.black_id] += scores.get(pr.white_id, 0.0)
+        elif pr.result == "0.5-0.5" and pr.black_id is not None:
+            sb[pr.white_id] += scores.get(pr.black_id, 0.0) / 2
+            sb[pr.black_id] += scores.get(pr.white_id, 0.0) / 2
+
+    return {pid: {"buchholz": buchholz.get(pid, 0.0), "sb": sb.get(pid, 0.0)} for pid in scores}
+
+
+
+    for pr in sess.query(Pairing).filter(Pairing.finished == True).all():  # noqa: E712
+        if pr.result == "1-0" and pr.white_id:
+        elif pr.result == "0-1" and pr.black_id:
+
+    rows: List[Dict[str, float]] = []
+        rows.append(
+            {
+                "pid": p.id,
+                "name": p.name,
+                "rating": p.rating,
+                "club": p.club,
+                "score": round(float(scores.get(p.id, 0.0)), 2),
+                "buchholz": round(float(tb.get(p.id, {}).get("buchholz", 0.0)), 2),
+                "sb": round(float(tb.get(p.id, {}).get("sb", 0.0)), 2),
+                "wins": wins.get(p.id, 0),
+                "byes": p.bye_count,
+            }
+        )
+
+    rows.sort(
+        key=lambda r: (
+            -r["score"],
+            -r["buchholz"],
+            -r["sb"],
+            -r["wins"],
+            -r["rating"],
+            r["pid"],
+        )
+    )
+
+
+        return self.white_ct - self.black_ct
+
+
+def choose_bye(seeds: List[Seed]) -> Optional[int]:
+    if len(seeds) % 2 == 0:
+        return None
+    candidates = sorted(seeds, key=lambda s: (s.bye_count, s.score, s.rating, s.pid))
+    return candidates[0].pid if candidates else None
+
+
+def make_swiss_pairings(sess, round_number: int) -> List[Tuple[int, Optional[int]]]:
+    players = sess.query(Player).order_by(Player.id.asc()).all()
+    existing_round = sess.query(Round).filter(Round.number == round_number).first()
+    if existing_round:
         return []
 
-    scores = get_scores(sess)
-    colors = get_color_history(sess)
-        s = Seed(
-            pid=p.id,
-            name=p.name,
-            rating=p.rating or 1200,
-            score=round(float(scores.get(p.id, 0.0)), 2),
-            white_ct=colors.get(p.id, (0, 0))[0],
-            black_ct=colors.get(p.id, (0, 0))[1],
-            bye_count=p.bye_count,
-        )
-        seeds.append(s)
-    if len(seeds) % 2 == 1:
-        candidates = list(reversed(seeds))
-        no_bye = [s for s in candidates if s.bye_count == 0]
-        pool = no_bye if no_bye else candidates
-        pool.sort(key=lambda s: (s.score, s.rating, s.pid))
-        bye_pid = pool[0].pid
-        # Remove the bye player from pairing pool
-        seeds = [s for s in seeds if s.pid != bye_pid]
+    opponents = opponents_map(sess)
 
-    round = relationship("Round", back_populates="pairings")
-    white = relationship("Player", foreign_keys=[white_id])
-    black = relationship("Player", foreign_keys=[black_id])
-
-    __table_args__ = (
-        UniqueConstraint("round_id", "board_no", name="uq_round_board"),
-    )
-
-    def __repr__(self):
-        return f"<Pairing R{self.round_id} B{self.board_no} {self.white_id} vs {self.black_id} {self.result}>"
-
-
-Base.metadata.create_all(engine)
-
-
-# ---------------------------------
-# Helpers: scoring, color history, opponents, tiebreaks
-# ---------------------------------
-Result = str  # alias
-
-SCORE_MAP = {
-    "1-0": (1.0, 0.0),
-    "0-1": (0.0, 1.0),
-    "0.5-0.5": (0.5, 0.5),
-    "BYE": (1.0, 0.0),  # white gets a bye point
-}
-
-
-def get_all_rounds(sess) -> List[Round]:
-    return sess.query(Round).order_by(Round.number.asc()).all()
-
-
-def get_current_round_number(sess) -> int:
-    r = sess.query(func.max(Round.number)).scalar()
-    return int(r or 0)
-
-
-def get_scores(sess) -> Dict[int, float]:
-    """Compute total points per player from all finished results."""
-    scores: Dict[int, float] = {p.id: 0.0 for p in sess.query(Player).all()}
-    pairings: List[Pairing] = sess.query(Pairing).all()
-    for pr in pairings:
-        if pr.result in SCORE_MAP and pr.finished:
-            w, b = pr.white_id, pr.black_id
-            ws, bs = SCORE_MAP[pr.result]
-            if pr.result == "BYE":
-                # BYE is recorded as white_id gets 1 point, black_id is None
-                scores[w] = scores.get(w, 0.0) + ws
-            else:
-                scores[w] = scores.get(w, 0.0) + ws
-                scores[b] = scores.get(b, 0.0) + bs
-    return scores
-
-
-def get_color_history(sess) -> Dict[int, Tuple[int, int]]:
-    """Return {player_id: (white_count, black_count)}"""
-    hist = {p.id: (0, 0) for p in sess.query(Player).all()}
-    for pr in sess.query(Pairing).all():
-        if pr.white_id:
-            w = hist[pr.white_id]
-            hist[pr.white_id] = (w[0] + 1, w[1])
-        if pr.black_id:
-            b = hist[pr.black_id]
-            hist[pr.black_id] = (b[0], b[1] + 1)
-    return hist
-
-
-def opponents_map(sess) -> Dict[int, set]:
-    om: Dict[int, set] = {p.id: set() for p in sess.query(Player).all()}
-    for pr in sess.query(Pairing).all():
-        if pr.white_id and pr.black_id:
-            om[pr.white_id].add(pr.black_id)
-    rnd = Round(number=round_number)
-BASE_HTML = """
-<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Swiss League</title>
-  <style>
-    :root {
-      color-scheme: light;
-    }
-    * { box-sizing: border-box; }
-    body {
-      font-family: 'Segoe UI', Tahoma, sans-serif;
-      background: #f3f6fb;
-      margin: 0;
-      color: #1f2933;
-    }
-    a { color: inherit; }
-    .page {
-      max-width: 1100px;
-      margin: 0 auto;
-      padding: 32px 20px 48px;
-    }
-    header {
-      display: flex;
-      flex-wrap: wrap;
-      align-items: center;
-      justify-content: space-between;
-      gap: 12px;
-      margin-bottom: 24px;
-    }
-    nav {
-      display: flex;
-      gap: 8px;
-      flex-wrap: wrap;
-    }
-    .card {
-      background: #ffffff;
-      border-radius: 14px;
-      padding: 24px;
-      box-shadow: 0 10px 28px rgba(15, 23, 42, 0.08);
-    }
-    .layout {
-      display: grid;
-      grid-template-columns: minmax(0, 2fr) minmax(0, 1fr);
-      gap: 24px;
-    }
-    @media (max-width: 960px) {
-      .layout {
-        grid-template-columns: 1fr;
-      }
-    }
-    .table {
-      width: 100%;
-      border-collapse: collapse;
-      font-size: 14px;
-    }
-    .table th {
-      text-align: left;
-      padding: 10px;
-      background: #eef2f7;
-      font-size: 11px;
-      letter-spacing: 0.08em;
-      text-transform: uppercase;
-      color: #475569;
-    }
-    .table td {
-      padding: 10px;
-      border-top: 1px solid #e2e8f0;
-    }
-    .btn {
-      display: inline-flex;
-      align-items: center;
-      gap: 6px;
-      padding: 8px 16px;
-      border-radius: 8px;
-      border: none;
-      font-weight: 600;
-      background: #1f2937;
-      color: #ffffff;
-      text-decoration: none;
-      cursor: pointer;
-      transition: background 0.2s ease;
-    }
-    .btn:hover { background: #111827; }
-    .btn-secondary {
-      background: #e2e8f0;
-      color: #1f2937;
-    }
-    .btn-secondary:hover { background: #cbd5f5; }
-    .btn-disabled, .btn:disabled {
-      opacity: 0.55;
-      cursor: not-allowed;
-      background: #9ca3af;
-    }
-    .tag {
-      display: inline-block;
-      padding: 2px 10px;
-      border-radius: 999px;
-      font-size: 12px;
-      background: #e2e8f0;
-      color: #1f2937;
-    }
-    .flash {
-      background: #fff7ed;
-      border: 1px solid #fbc38d;
-      color: #9a3412;
-      padding: 12px 16px;
-      border-radius: 10px;
-      margin-bottom: 16px;
-    }
-    form.inline {
-      display: inline-flex;
-      gap: 8px;
-      align-items: center;
-      flex-wrap: wrap;
-    }
-    input[type="text"], input[type="number"], input[type="file"], select {
-      padding: 8px 10px;
-      border-radius: 8px;
-      border: 1px solid #cbd5f5;
-      font-size: 14px;
-    }
-    label.checkbox {
-      font-size: 12px;
-      display: inline-flex;
-      align-items: center;
-      gap: 4px;
-    }
-    footer {
-      margin-top: 40px;
-      font-size: 12px;
-      color: #64748b;
-      text-align: center;
-    }
-  </style>
-</head>
-<body>
-  <div class="page">
-    <header>
-      <h1 style="margin:0;font-size:28px;font-weight:700;">Swiss League</h1>
-      <nav>
-        <a class="btn btn-secondary" href="{{ url_for('index') }}">Standings</a>
-        <a class="btn btn-secondary" href="{{ url_for('players') }}">Players</a>
-        <a class="btn btn-secondary" href="{{ url_for('rounds') }}">Rounds</a>
-        <a class="btn btn-secondary" href="{{ url_for('import_xlsm') }}">Import XLSM</a>
-        <a class="btn" href="{{ url_for('export_xlsx') }}">Export XLSX</a>
-      </nav>
-    </header>
-    {% with messages = get_flashed_messages() %}
-      {% if messages %}
-        {% for m in messages %}
-          <div class="flash">{{ m }}</div>
-        {% endfor %}
-      {% endif %}
-    {% endwith %}
-    {% block content %}{% endblock %}
-    <footer>Built for Excel-style Swiss tournaments.</footer>
-  </div>
-</body>
-</html>
-"""
+    seeds: List[Seed] = []
+    for p in players:
+        seeds.append(
+            Seed(
+                pid=p.id,
+                name=p.name,
+                rating=p.rating or 1200,
+                score=round(float(scores.get(p.id, 0.0)), 2),
+                white_ct=colors.get(p.id, (0, 0))[0],
+                black_ct=colors.get(p.id, (0, 0))[1],
+                bye_count=p.bye_count,
+            )
 
-INDEX_HTML = """
-{% extends 'base.html' %}
-{% block content %}
-<div class="layout">
-  <section class="card">
-    <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:16px;flex-wrap:wrap;">
-      <h2 style="margin:0;font-size:20px;">Standings</h2>
-      <form method="post" action="{{ url_for('generate_round') }}">
-        <button class="btn {% if not can_generate %}btn-disabled{% endif %}" {% if not can_generate %}disabled{% endif %}>Generate Round {{ next_round }}</button>
-      </form>
-    </div>
-    <div style="overflow-x:auto;">
-      <table class="table">
-        <thead>
-          <tr>
-            <th>#</th>
-            <th>Player</th>
-            <th>Rating</th>
-            <th>Pts</th>
-            <th>Buchholz</th>
-            <th>Sonneborn-Berger</th>
-            <th>Wins</th>
-          </tr>
-        </thead>
-        <tbody>
-          {% for row in table %}
-          <tr>
-            <td>{{ loop.index }}</td>
-            <td style="font-weight:600;">{{ row.name }}</td>
-            <td>{{ row.rating }}</td>
-            <td style="font-weight:600;">{{ '%.1f'|format(row.score) }}</td>
-            <td>{{ '%.1f'|format(row.buchholz) }}</td>
-            <td>{{ '%.1f'|format(row.sb) }}</td>
-            <td>{{ row.wins }}</td>
-          </tr>
-          {% endfor %}
-        </tbody>
-      </table>
-    </div>
-  </section>
+    seeds.sort(key=lambda s: (-s.score, -s.rating, s.pid))
 
-  <section class="card">
-    <h2 style="margin-top:0;font-size:20px;">Quick Actions</h2>
-    <ul style="list-style:none;padding-left:0;margin:0;display:grid;gap:8px;">
-      <li><a class="btn btn-secondary" href="{{ url_for('players') }}">Add/Import Players</a></li>
-      <li><a class="btn btn-secondary" href="{{ url_for('rounds') }}">Enter Results</a></li>
-      <li><a class="btn btn-secondary" href="{{ url_for('export_xlsx') }}">Export XLSX Snapshot</a></li>
-    </ul>
-    <p style="margin-top:18px;font-size:14px;color:#475569;line-height:1.4;">This mirrors your Excel flow: maintain Players → generate Round pairings → enter results → view real-time Standings → export.</p>
-  </section>
-</div>
-{% endblock %}
-"""
+    bye_pid = choose_bye(seeds)
+    pool = [s for s in seeds if s.pid != bye_pid]
 
-PLAYERS_HTML = """
-{% extends 'base.html' %}
-{% block content %}
-<section class="card">
-  <div style="display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap;align-items:flex-end;margin-bottom:18px;">
-    <h2 style="margin:0;font-size:20px;">Players</h2>
-    <form method="post" class="inline">
-      <input type="text" name="name" placeholder="Name" required>
-      <input type="number" name="rating" placeholder="Rating" value="1200">
-      <input type="text" name="club" placeholder="Club (optional)">
-      <button class="btn" type="submit">Add</button>
-    </form>
-  </div>
+    pairings: List[Tuple[int, Optional[int]]] = []
+    used = set()
 
-  <div style="margin-bottom:24px;">
-    <form method="post" action="{{ url_for('import_csv') }}" enctype="multipart/form-data" class="inline">
-      <label style="font-weight:600;">Import CSV</label>
-      <input type="file" name="file" accept=".csv" required>
-      <button class="btn" type="submit">Upload</button>
-      <span style="font-size:12px;color:#64748b;">Headers: name,rating,club</span>
-    </form>
-  </div>
+    def candidate_score(a: Seed, b: Seed) -> Tuple[float, int, int, int]:
+        score_gap = abs(a.score - b.score)
+        color_diff = abs((a.color_balance) - (-b.color_balance))
+        rating_gap = abs(a.rating - b.rating)
+        return (score_gap, color_diff, rating_gap, b.pid)
 
-  <div style="overflow-x:auto;">
-    <table class="table">
-      <thead>
-        <tr>
-          <th>ID</th>
-          <th>Name</th>
-          <th>Rating</th>
-          <th>Club</th>
-          <th>Byes</th>
-          <th>Actions</th>
-        </tr>
-      </thead>
-      <tbody>
-        {% for p in players %}
-        <tr>
-          <td>{{ p.id }}</td>
-          <td style="font-weight:600;">{{ p.name }}</td>
-          <td>{{ p.rating }}</td>
-          <td>{{ p.club }}</td>
-          <td>{{ p.bye_count }}</td>
-          <td>
-            <a class="btn btn-secondary" href="{{ url_for('delete_player', pid=p.id) }}" onclick="return confirm('Delete player?')">Delete</a>
-          </td>
-        </tr>
-        {% endfor %}
-      </tbody>
-    </table>
-  </div>
-</section>
-{% endblock %}
-"""
-
-ROUNDS_HTML = """
-{% extends 'base.html' %}
-{% block content %}
-<section class="card">
-  <div style="display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap;align-items:center;margin-bottom:20px;">
-    <h2 style="margin:0;font-size:20px;">Rounds &amp; Pairings</h2>
-    <form method="post" action="{{ url_for('generate_round') }}">
-      <button class="btn">Generate Round {{ next_round }}</button>
-    </form>
-  </div>
-
-  {% for r in rounds %}
-  <div style="border:1px solid #e2e8f0;border-radius:12px;padding:16px;margin-bottom:16px;background:#fafbff;">
-    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;flex-wrap:wrap;gap:10px;">
-      <h3 style="margin:0;font-size:18px;">Round {{ r.number }}</h3>
-      <span class="tag">{{ r.pairings|length }} boards</span>
-    </div>
-    <div style="overflow-x:auto;">
-      <table class="table">
-        <thead>
-          <tr>
-            <th>Board</th>
-            <th>White</th>
-            <th>Black</th>
-            <th>Result</th>
-            <th>Actions</th>
-          </tr>
-        </thead>
-        <tbody>
-          {% for pr in r.pairings|sort(attribute='board_no') %}
-          <tr>
-            <td>{{ pr.board_no }}</td>
-            <td>{{ pr.white.name if pr.white else '-' }}</td>
-            <td>{{ pr.black.name if pr.black else '-' }}</td>
-            <td style="font-weight:600;">{{ pr.result }}</td>
-            <td>
-              {% if pr.black is none %}
-                <span class="tag">BYE</span>
-              {% else %}
-              <form method="post" action="{{ url_for('update_result', pairing_id=pr.id) }}" class="inline">
-                <select name="result">
-                  <option value="*" {% if pr.result=='*' %}selected{% endif %}>*</option>
-                  <option value="1-0" {% if pr.result=='1-0' %}selected{% endif %}>1-0</option>
-                  <option value="0-1" {% if pr.result=='0-1' %}selected{% endif %}>0-1</option>
-                  <option value="0.5-0.5" {% if pr.result=='0.5-0.5' %}selected{% endif %}>½-½</option>
-                </select>
-                <label class="checkbox"><input type="checkbox" name="started" value="1" {% if pr.started %}checked{% endif %}> started</label>
-                <label class="checkbox"><input type="checkbox" name="finished" value="1" {% if pr.finished %}checked{% endif %}> finished</label>
-                <button class="btn btn-secondary" type="submit">Save</button>
-              </form>
-              {% endif %}
-            </td>
-          </tr>
-          {% endfor %}
-        </tbody>
-      </table>
-    </div>
-  </div>
-  {% endfor %}
-</section>
-{% endblock %}
-"""
-
-IMPORT_XLSM_HTML = """
-{% extends 'base.html' %}
-{% block content %}
-<section class="card" style="max-width:720px;margin:0 auto;">
-  <h2 style="margin-top:0;font-size:20px;">Import SwissChessLeaguev4.xlsm</h2>
-  <p style="font-size:14px;color:#475569;line-height:1.5;">Provide a file path or upload the workbook. Visible values are imported so the players, past rounds, and standings mirror Excel.</p>
-  <form method="post" enctype="multipart/form-data" style="display:grid;gap:16px;margin-top:24px;">
-    <label style="display:grid;gap:8px;font-size:14px;">
-      <span style="font-weight:600;">Workbook path (optional)</span>
-      <input type="text" name="path" placeholder="SwissChessLeaguev4.xlsm" value="{{ default_path }}">
-    </label>
-    <label style="display:grid;gap:8px;font-size:14px;">
-      <span style="font-weight:600;">Or upload .xlsm</span>
-      <input type="file" name="file" accept=".xlsm,.xlsx">
-    </label>
-    <div style="display:flex;justify-content:flex-end;gap:12px;flex-wrap:wrap;">
-      <a class="btn btn-secondary" href="{{ url_for('index') }}">Cancel</a>
-      <button class="btn" type="submit">Import Workbook</button>
-    </div>
-  </form>
-</section>
-{% endblock %}
-"""
-
-# Register templates
-app.jinja_loader = DictLoader({
-    "base.html": BASE_HTML,
-    "index.html": INDEX_HTML,
-    "players.html": PLAYERS_HTML,
-    "rounds.html": ROUNDS_HTML,
-    "import_xlsm.html": IMPORT_XLSM_HTML,
-})
-@app.route("/")
-def index():
-    sess = SessionLocal()
-    try:
-        rows = compute_standings(sess)
-        cur = get_current_round_number(sess)
-        can_gen = sess.query(Player).count() >= 2
-        return render_template(
-            "index.html",
-            table=rows,
-            can_generate=can_gen,
-            next_round=cur + 1,
-        )
-    finally:
-        sess.close()
-
-
-@app.route("/players", methods=["GET", "POST"])
-def players():
-    sess = SessionLocal()
-    try:
-        if request.method == "POST":
-            name = request.form.get("name", "").strip()
-            rating = safe_rating(request.form.get("rating"), 1200)
-            club = request.form.get("club", "").strip()
-            if name:
-                sess.add(Player(name=name, rating=rating, club=club))
-                sess.commit()
-                flash("Player added.")
-            return redirect(url_for("players"))
-
-        return render_template("players.html", players=sess.query(Player).order_by(Player.id.asc()).all())
-    finally:
-        sess.close()
-        for row in rdr:
-            name = (row.get("name") or "").strip()
-            if not name:
+    while pool:
+        a = pool.pop(0)
+        if a.pid in used:
+            continue
+        best_idx = None
+        best_metric = None
+        for idx, b in enumerate(pool):
+            if b.pid in used:
                 continue
-            rating = safe_rating(row.get("rating"), 1200)
-            club = (row.get("club") or "").strip()
-            sess.add(Player(name=name, rating=rating, club=club))
-            count += 1
-@app.route("/rounds")
-def rounds():
+            if b.pid in opponents.get(a.pid, set()):
+                continue
+            metric = candidate_score(a, b)
+            if best_metric is None or metric < best_metric:
+                best_metric = metric
+                best_idx = idx
+        if best_idx is None:
+            # no opponent avoiding rematch found; pick first available
+            for idx, b in enumerate(pool):
+                if b.pid not in used:
+                    best_idx = idx
+                    break
+        if best_idx is None:
+            break
+        opponent = pool.pop(best_idx)
+        used.add(a.pid)
+        used.add(opponent.pid)
+        pairings.append((a.pid, opponent.pid))
+
+    if bye_pid is not None:
+        pairings.append((bye_pid, None))
+
+    if not pairings:
+        return []
+
+    sess.add(rnd)
+    sess.flush()
+
+    for board_no, (white_id, black_id) in enumerate(pairings, start=1):
+        pr = Pairing(round_id=rnd.id, board_no=board_no, white_id=white_id, black_id=black_id)
+        if black_id is None:
+            pr.result = "BYE"
+            pr.started = True
+            pr.finished = True
+            player = sess.get(Player, white_id)
+            if player:
+                player.bye_count += 1
+        sess.add(pr)
+    sess.commit()
+    return pairings
+
+
+# ---------------------------------------------------------------------------
+# Templates
+# ---------------------------------------------------------------------------
+<html lang=\"en\">
+  <meta charset=\"utf-8\">
+  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">
+    :root { color-scheme: light; }
+      .layout { grid-template-columns: 1fr; }
+    .btn:disabled {
+    input[type=\"text\"], input[type=\"number\"], input[type=\"file\"], select {
+  <div class=\"page\">
+      <h1 style=\"margin:0;font-size:28px;font-weight:700;\">Swiss League</h1>
+        <a class=\"btn btn-secondary\" href=\"{{ url_for('index') }}\">Standings</a>
+        <a class=\"btn btn-secondary\" href=\"{{ url_for('players') }}\">Players</a>
+        <a class=\"btn btn-secondary\" href=\"{{ url_for('rounds') }}\">Rounds</a>
+        <a class=\"btn btn-secondary\" href=\"{{ url_for('import_xlsm') }}\">Import XLSM</a>
+        <a class=\"btn\" href=\"{{ url_for('export_xlsx') }}\">Export XLSX</a>
+          <div class=\"flash\">{{ m }}</div>
+<div class=\"layout\">
+  <section class=\"card\">
+    <div style=\"display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap;align-items:center;margin-bottom:20px;\">
+      <h2 style=\"margin:0;font-size:20px;\">Standings</h2>
+      <form method=\"post\" action=\"{{ url_for('generate_round') }}\">
+        <button class=\"btn\" {% if not can_generate %}disabled{% endif %}>Generate Round {{ next_round }}</button>
+    <div style=\"overflow-x:auto;\">
+      <table class=\"table\">
+            <th>Rank</th>
+            <th>Name</th>
+            <th>Club</th>
+            <th>Score</th>
+            <th>SB</th>
+            <th>Byes</th>
+            <td style=\"font-weight:600;\">{{ row.name }}</td>
+            <td>{{ row.club }}</td>
+            <td>{{ '%.1f'|format(row.score) }}</td>
+            <td>{{ row.byes }}</td>
+  <section class=\"card\" style=\"height:fit-content;\">
+    <h2 style=\"margin-top:0;font-size:18px;\">Quick Add Player</h2>
+    <form method=\"post\" action=\"{{ url_for('players') }}\" style=\"display:grid;gap:12px;\">
+      <label> Name <input type=\"text\" name=\"name\" required></label>
+      <label> Rating <input type=\"number\" name=\"rating\" value=\"1200\"></label>
+      <label> Club <input type=\"text\" name=\"club\"></label>
+      <button class=\"btn\" type=\"submit\">Add player</button>
+    </form>
+<section class=\"card\">
+  <div style=\"display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap;align-items:center;margin-bottom:20px;\">
+    <h2 style=\"margin:0;font-size:20px;\">Players</h2>
+    <form method=\"post\" style=\"display:flex;gap:8px;flex-wrap:wrap;align-items:center;\">
+      <input type=\"text\" name=\"name\" placeholder=\"Name\" required>
+      <input type=\"number\" name=\"rating\" placeholder=\"Rating\" value=\"1200\">
+      <input type=\"text\" name=\"club\" placeholder=\"Club\">
+      <button class=\"btn\" type=\"submit\">Add</button>
+  <div style=\"overflow-x:auto;\">
+    <table class=\"table\">
+          <td style=\"font-weight:600;\">{{ p.name }}</td>
+            <a class=\"btn btn-secondary\" href=\"{{ url_for('delete_player', pid=p.id) }}\" onclick=\"return confirm('Delete player?')\">Delete</a>
+<section class=\"card\">
+  <div style=\"display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap;align-items:center;margin-bottom:20px;\">
+    <h2 style=\"margin:0;font-size:20px;\">Rounds &amp; Pairings</h2>
+    <form method=\"post\" action=\"{{ url_for('generate_round') }}\">
+      <button class=\"btn\">Generate Round {{ next_round }}</button>
+  <div style=\"border:1px solid #e2e8f0;border-radius:12px;padding:16px;margin-bottom:16px;background:#fafbff;\">
+    <div style=\"display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;flex-wrap:wrap;gap:10px;\">
+      <h3 style=\"margin:0;font-size:18px;\">Round {{ r.number }}</h3>
+      <span class=\"tag\">{{ r.pairings|length }} boards</span>
+    <div style=\"overflow-x:auto;\">
+      <table class=\"table\">
+            <td style=\"font-weight:600;\">{{ pr.result }}</td>
+                <span class=\"tag\">BYE</span>
+              <form method=\"post\" action=\"{{ url_for('update_result', pairing_id=pr.id) }}\" class=\"inline\">
+                <select name=\"result\">
+                  <option value=\"*\" {% if pr.result=='*' %}selected{% endif %}>*</option>
+                  <option value=\"1-0\" {% if pr.result=='1-0' %}selected{% endif %}>1-0</option>
+                  <option value=\"0-1\" {% if pr.result=='0-1' %}selected{% endif %}>0-1</option>
+                  <option value=\"0.5-0.5\" {% if pr.result=='0.5-0.5' %}selected{% endif %}>½-½</option>
+                <label class=\"checkbox\"><input type=\"checkbox\" name=\"started\" value=\"1\" {% if pr.started %}checked{% endif %}> started</label>
+                <label class=\"checkbox\"><input type=\"checkbox\" name=\"finished\" value=\"1\" {% if pr.finished %}checked{% endif %}> finished</label>
+                <button class=\"btn btn-secondary\" type=\"submit\">Save</button>
+<section class=\"card\" style=\"max-width:720px;margin:0 auto;\">
+  <h2 style=\"margin-top:0;font-size:20px;\">Import SwissChessLeaguev4.xlsm</h2>
+  <p style=\"font-size:14px;color:#475569;line-height:1.5;\">Provide a file path or upload the workbook so players, past rounds, and standings mirror Excel.</p>
+  <form method=\"post\" enctype=\"multipart/form-data\" style=\"display:grid;gap:16px;margin-top:24px;\">
+    <label style=\"display:grid;gap:8px;font-size:14px;\">
+      <span style=\"font-weight:600;\">Workbook path (optional)</span>
+      <input type=\"text\" name=\"path\" placeholder=\"SwissChessLeaguev4.xlsm\" value=\"{{ default_path }}\">
+    <label style=\"display:grid;gap:8px;font-size:14px;\">
+      <span style=\"font-weight:600;\">Or upload .xlsm</span>
+      <input type=\"file\" name=\"file\" accept=\".xlsm,.xlsx\">
+    <div style=\"display:flex;justify-content:flex-end;gap:12px;flex-wrap:wrap;\">
+      <a class=\"btn btn-secondary\" href=\"{{ url_for('index') }}\">Cancel</a>
+      <button class=\"btn\" type=\"submit\">Import Workbook</button>
+app.jinja_loader = DictLoader(
+    {
+        "base.html": BASE_HTML,
+        "index.html": INDEX_HTML,
+        "players.html": PLAYERS_HTML,
+        "rounds.html": ROUNDS_HTML,
+        "import_xlsm.html": IMPORT_XLSM_HTML,
+    }
+)
+
+
+# ---------------------------------------------------------------------------
+# Routes
+# ---------------------------------------------------------------------------
+        standings = compute_standings(sess)
+        next_round = get_current_round_number(sess) + 1
+        can_generate = sess.query(Player).count() >= 2
+            table=standings,
+            can_generate=can_generate,
+            next_round=next_round,
+
+
+        players_list = sess.query(Player).order_by(Player.id.asc()).all()
+        return render_template("players.html", players=players_list)
+
+
+@app.route("/players/<int:pid>/delete")
+def delete_player(pid: int):
     sess = SessionLocal()
     try:
-        return render_template(
-            "rounds.html",
-            rounds=get_all_rounds(sess),
-            next_round=get_current_round_number(sess) + 1,
+        player = sess.get(Player, pid)
+        if player:
+            sess.delete(player)
+            sess.commit()
+            flash("Player deleted.")
+        else:
+            flash("Player not found.")
+    finally:
+        sess.close()
+    return redirect(url_for("players"))
+
+
+            rounds=sess.query(Round).order_by(Round.number.asc()).all(),
+
+
+
+
+        if pr is None:
+            flash("Pairing not found.")
+            return redirect(url_for("rounds"))
+
+        result = request.form.get("result", "*").strip()
+        if result not in ALLOWED_RESULTS:
+            result = "*"
+        started = request.form.get("started") == "1"
+        finished = request.form.get("finished") == "1"
+
+        pr.result = result
+        pr.started = started or result in SCORE_MAP
+        pr.finished = finished or result in SCORE_MAP and result != "*"
+
+        if pr.result != "BYE" and pr.black_id is None and result in SCORE_MAP and result != "*":
+            # ensure both players exist for scored games
+            flash("Cannot record a result without two players.")
+        else:
+            sess.commit()
+            flash("Result updated.")
+            workbook = load_workbook(io.BytesIO(data), data_only=True, keep_vba=True)
+    except Exception as exc:  # pragma: no cover - defensive
+    def first_header(sheet) -> Tuple[Optional[int], Dict[str, int]]:
+        mapping: Dict[str, int] = {}
+        header_idx: Optional[int] = None
+            labels = [str(cell).strip().lower() if cell is not None else "" for cell in row]
+            if any(labels):
+                mapping = {label: i for i, label in enumerate(labels) if label}
+                header_idx = idx
+                break
+        return header_idx, mapping
+
+    def find_col(mapping: Dict[str, int], name: str) -> Optional[int]:
+        name = name.lower()
+        for key, idx in mapping.items():
+            if name == key or name in key:
+                return idx
+        existing_players: Dict[str, Player] = {p.name.casefold(): p for p in sess.query(Player).all()}
+        added_players = updated_players = 0
+        players_sheet = workbook["Players"] if "Players" in workbook.sheetnames else None
+                name = (row[mapping.get("name", -1)] or "").strip() if mapping.get("name") is not None else ""
+                rating_val = row[mapping.get("rating", -1)] if mapping.get("rating") is not None else None
+                club = (row[mapping.get("club", -1)] or "").strip() if mapping.get("club") is not None else ""
+                rating = safe_rating(rating_val)
+                if key in existing_players:
+                    player = existing_players[key]
+                    player.rating = rating
+                    player.club = club
+                round_no = int(match.group(1))
+                round_sheets.append((round_no, workbook[name]))
+        rounds_imported = pairings_imported = 0
+            if not mapping:
+                continue
+            for values in sheet.iter_rows(min_row=start_row, values_only=True):
+                values = list(values)
+
+                white_name = str(take(white_idx)).strip() if take(white_idx) else ""
+                black_name = str(take(black_idx)).strip() if take(black_idx) else ""
+                is_bye = normalized_result == "BYE" or (black_player is None and not black_name)
+@app.route("/export_xlsx")
+        rounds = sess.query(Round).order_by(Round.number.asc()).all()
+        standings = compute_standings(sess)
+
+        players_rows = [
+            {
+                "Player ID": p.id,
+                "Name": p.name,
+                "Rating": p.rating,
+                "Club": p.club,
+                "Byes": p.bye_count,
+            }
+            for p in players
+        ]
+
+        standings_rows = [
+            {
+                "Rank": idx + 1,
+                "Wins": row["wins"],
+                "Byes": row["byes"],
+            }
+            for idx, row in enumerate(standings)
+        ]
+        rounds_rows: List[Dict[str, object]] = []
+        for rnd in rounds:
+            for pr in sorted(rnd.pairings, key=lambda p: p.board_no):
+                rounds_rows.append(
+                    {
+                        "Round": rnd.number,
+                        "Board": pr.board_no,
+                        "White": pr.white.name if pr.white else "",
+                        "Black": pr.black.name if pr.black else "",
+                        "Result": pr.result,
+                        "Started": pr.started,
+                        "Finished": pr.finished,
+                    }
+                )
+            pd.DataFrame(players_rows).to_excel(writer, sheet_name="Players", index=False)
+            pd.DataFrame(rounds_rows).to_excel(writer, sheet_name="Rounds", index=False)
+            pd.DataFrame(standings_rows).to_excel(writer, sheet_name="Standings", index=False)
+
+        output.seek(0)
+        return send_file(
+            output,
+            mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            as_attachment=True,
+            download_name=f"swiss_export_{get_current_round_number(sess)}.xlsx",
         )
     finally:
         sess.close()
-
-
-@app.route("/generate_round", methods=["POST"])
-def generate_round():
-    sess = SessionLocal()
-    try:
-        if sess.query(Player).count() < 2:
-            flash("Add at least two players to generate pairings.")
-            return redirect(url_for("rounds"))
-        next_round = get_current_round_number(sess) + 1
-        pairings = make_swiss_pairings(sess, next_round)
-        if pairings:
-            flash(f"Generated {len(pairings)} pairings for Round {next_round}.")
-        else:
-            flash("No pairings generated.")
+
+
+# ---------------------------------------------------------------------------
+# Development helpers
+# ---------------------------------------------------------------------------
+def seed_if_empty() -> None:
+            for name, rating in [
+                ("Alpha", 1800),
+                ("Bravo", 1700),
+                ("Charlie", 1650),
+                ("Delta", 1600),
+            ]:
+                sess.add(Player(name=name, rating=rating))
+            sess.commit()
     finally:
-        sess.close()
-    return redirect(url_for("rounds"))
-
-
-@app.route("/update_result/<int:pairing_id>", methods=["POST"])
-def update_result(pairing_id: int):
-    sess = SessionLocal()
-    try:
-        pr = sess.get(Pairing, pairing_id)
-        flash("Result updated.")
-    finally:
-        sess.close()
-    return redirect(url_for("rounds"))
-
-
-@app.route("/import_xlsm", methods=["GET", "POST"])
-def import_xlsm():
-    default_path = os.path.abspath("SwissChessLeaguev4.xlsm")
-    if request.method == "GET":
-        return render_template("import_xlsm.html", default_path=default_path)
-
-    file = request.files.get("file")
-    path_value = (request.form.get("path") or "").strip()
-    chosen_path = path_value or default_path
-
-    try:
-        if file and file.filename:
-            data = file.read()
-            if not data:
-                raise ValueError("Uploaded file is empty.")
-            stream = io.BytesIO(data)
-            workbook = load_workbook(stream, data_only=True, keep_vba=True)
-            source_desc = file.filename
-        else:
-            abs_path = os.path.abspath(chosen_path)
-            if not os.path.exists(abs_path):
-                flash(f"Workbook not found: {abs_path}")
-                return redirect(url_for("import_xlsm"))
-            workbook = load_workbook(abs_path, data_only=True, keep_vba=True)
-            source_desc = abs_path
-    except Exception as exc:
-        flash(f"Import failed: {exc}")
         return redirect(url_for("import_xlsm"))
 
     def first_header(sheet):
