@@ -1,40 +1,36 @@
-import { rulesText, players as playerSeedData, initialPairings } from './data.js';
+import { RESULT } from '../shared/constants.js';
 
-const RESULT = {
-  UNPLAYED: 'UNPLAYED',
-  PLAYER1: 'PLAYER1',
-  PLAYER2: 'PLAYER2',
-  DRAW: 'DRAW',
-  BYE: 'BYE'
+const API_BASE = (window.APP_API_BASE || `${window.location.origin.replace(/\/$/, '')}/api`).replace(/\/$/, '');
+
+const state = {
+  rules: [],
+  players: [],
+  rounds: [],
+  standings: [],
+  canGenerateNextRound: false
 };
 
-const state = createInitialState();
-
-function createInitialState() {
-  const players = playerSeedData.map((player) => ({
-    ...player,
-    addScore: 0,
-    history: []
-  }));
-
-  const rounds = [
-    {
-      roundNumber: 1,
-      pairings: initialPairings.map((pairing) => ({
-        ...pairing,
-        result: RESULT.UNPLAYED
-      }))
-    }
-  ];
-
-  return { players, rounds };
+async function fetchJSON(url, options = {}) {
+  const response = await fetch(url, options);
+  if (!response.ok) {
+    const message = await response.text();
+    throw new Error(message || 'Request failed');
+  }
+  if (response.status === 204) {
+    return null;
+  }
+  return response.json();
 }
 
-function resetTournament() {
-  const fresh = createInitialState();
-  state.players = fresh.players;
-  state.rounds = fresh.rounds;
+async function refreshState() {
+  const data = await fetchJSON(`${API_BASE}/state`);
+  Object.assign(state, data);
   renderApp();
+}
+
+async function resetTournament() {
+  await fetchJSON(`${API_BASE}/reset`, { method: 'POST' });
+  await refreshState();
 }
 
 function createElement(tag, options = {}, ...children) {
@@ -67,238 +63,33 @@ function getPlayerById(id) {
   return state.players.find((player) => player.id === id);
 }
 
-function gatherOpponentHistory() {
-  const history = new Map();
-  state.players.forEach((player) => {
-    history.set(player.id, new Set());
-  });
-
-  state.rounds.forEach((round) => {
-    round.pairings.forEach((pairing) => {
-      if (!pairing.player1 || !pairing.player2) return;
-      history.get(pairing.player1).add(pairing.player2);
-      history.get(pairing.player2).add(pairing.player1);
-    });
-  });
-
-  return history;
-}
-
-function recalculateStandings() {
-  const statsMap = new Map();
-
-  state.players.forEach((player) => {
-    statsMap.set(player.id, {
-      id: player.id,
-      seed: player.seed,
-      name: player.fullName || player.name,
-      displayName: player.name,
-      addScore: player.addScore ?? 0,
-      opponents: new Set(),
-      wins: 0,
-      losses: 0,
-      draws: 0,
-      byes: 0,
-      basePoints: 0
-    });
-  });
-
-  state.rounds.forEach((round) => {
-    round.pairings.forEach((pairing) => {
-      const { player1, player2, result } = pairing;
-      const p1Stats = statsMap.get(player1);
-      const p2Stats = player2 ? statsMap.get(player2) : null;
-
-      if (player2) {
-        p1Stats.opponents.add(player2);
-        if (p2Stats) {
-          p2Stats.opponents.add(player1);
-        }
-      }
-
-      switch (result) {
-        case RESULT.PLAYER1:
-          p1Stats.wins += 1;
-          p1Stats.basePoints += 1;
-          if (p2Stats) {
-            p2Stats.losses += 1;
-          }
-          break;
-        case RESULT.PLAYER2:
-          if (p2Stats) {
-            p2Stats.wins += 1;
-            p2Stats.basePoints += 1;
-          }
-          p1Stats.losses += 1;
-          break;
-        case RESULT.DRAW:
-          p1Stats.draws += 1;
-          p1Stats.basePoints += 0.5;
-          if (p2Stats) {
-            p2Stats.draws += 1;
-            p2Stats.basePoints += 0.5;
-          }
-          break;
-        case RESULT.BYE:
-          p1Stats.byes += 1;
-          p1Stats.basePoints += 1;
-          p1Stats.opponents.add('Bye');
-          break;
-        default:
-          break;
-      }
-    });
-  });
-
-  const standings = Array.from(statsMap.values()).map((stats) => {
-    const gamesPlayed = stats.wins + stats.losses + stats.draws + stats.byes;
-    const totalPoints = stats.basePoints + stats.addScore;
-    const winPercent = gamesPlayed === 0 ? 0 : (stats.basePoints / gamesPlayed) * 100;
-    const opponentSummaries = Array.from(stats.opponents).map((opponent) => {
-      if (opponent === 'Bye') {
-        return 'Bye';
-      }
-      const opponentData = getPlayerById(opponent);
-      return opponentData ? `${opponentData.name} (#${opponentData.id})` : `#${opponent}`;
-    });
-
-    return {
-      ...stats,
-      gamesPlayed,
-      totalPoints,
-      winPercent,
-      opponentSummaries
-    };
-  });
-
-  standings.sort((a, b) => {
-    if (b.totalPoints !== a.totalPoints) {
-      return b.totalPoints - a.totalPoints;
-    }
-    if (b.basePoints !== a.basePoints) {
-      return b.basePoints - a.basePoints;
-    }
-    if (b.winPercent !== a.winPercent) {
-      return b.winPercent - a.winPercent;
-    }
-    return a.seed - b.seed;
-  });
-
-  return standings;
-}
-
-function handleAddScoreChange(playerId, value) {
-  const player = getPlayerById(playerId);
-  if (!player) return;
+async function handleAddScoreChange(playerId, value) {
   const numericValue = Number.parseFloat(value);
-  player.addScore = Number.isFinite(numericValue) ? numericValue : 0;
-  renderApp();
-}
-
-function setMatchResult(roundIndex, table, result) {
-  const round = state.rounds[roundIndex];
-  if (!round) return;
-  const pairing = round.pairings.find((match) => match.table === table);
-  if (!pairing) return;
-
-  pairing.result = result;
-  renderApp();
-}
-
-function canGenerateNextRound() {
-  return state.rounds.every((round) => round.pairings.every((pairing) => pairing.result !== RESULT.UNPLAYED));
-}
-
-function generateNextRound() {
-  if (!canGenerateNextRound()) {
-    alert('Please enter results for every match before pairing the next round.');
-    return;
-  }
-
-  const standings = recalculateStandings();
-  const opponentHistory = gatherOpponentHistory();
-  const playersToPair = standings.map((entry) => entry.id);
-  const pairings = createSwissPairings(playersToPair, opponentHistory);
-  const nextRoundNumber = state.rounds.length + 1;
-
-  state.rounds.push({
-    roundNumber: nextRoundNumber,
-    pairings: pairings.map((pair, index) => {
-      if (pair.length === 1) {
-        return {
-          table: index + 1,
-          player1: pair[0],
-          player2: null,
-          player1Name: getPlayerById(pair[0]).name,
-          player2Name: 'Bye',
-          result: RESULT.BYE
-        };
-      }
-
-      const [player1Id, player2Id] = pair;
-      return {
-        table: index + 1,
-        player1: player1Id,
-        player2: player2Id,
-        player1Name: getPlayerById(player1Id).name,
-        player2Name: getPlayerById(player2Id).name,
-        result: RESULT.UNPLAYED
-      };
-    })
+  const payload = Number.isFinite(numericValue) ? numericValue : 0;
+  await fetchJSON(`${API_BASE}/players/${playerId}/adjustment`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ addScore: payload })
   });
-
-  renderApp();
+  await refreshState();
 }
 
-function createSwissPairings(playerIds, opponentHistory) {
-  const pool = [...playerIds];
-  let byePlayer = null;
+async function setMatchResult(matchId, result) {
+  await fetchJSON(`${API_BASE}/matches/${matchId}`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ result })
+  });
+  await refreshState();
+}
 
-  if (pool.length % 2 === 1) {
-    byePlayer = pool.pop();
+async function generateNextRound() {
+  try {
+    await fetchJSON(`${API_BASE}/rounds`, { method: 'POST' });
+    await refreshState();
+  } catch (error) {
+    alert(error.message || 'Unable to generate the next round.');
   }
-
-  let solution = null;
-
-  function backtrack(available, currentPairs) {
-    if (available.length === 0) {
-      solution = currentPairs;
-      return true;
-    }
-
-    const [player, ...rest] = available;
-
-    for (let i = 0; i < rest.length; i += 1) {
-      const opponent = rest[i];
-      if (opponentHistory.get(player).has(opponent)) {
-        continue;
-      }
-      const remaining = rest.slice(0, i).concat(rest.slice(i + 1));
-      if (backtrack(remaining, [...currentPairs, [player, opponent]])) {
-        return true;
-      }
-    }
-
-    for (let i = 0; i < rest.length; i += 1) {
-      const opponent = rest[i];
-      const remaining = rest.slice(0, i).concat(rest.slice(i + 1));
-      if (backtrack(remaining, [...currentPairs, [player, opponent]])) {
-        return true;
-      }
-    }
-
-    return false;
-  }
-
-  if (!backtrack(pool, [])) {
-    throw new Error('Unable to create Swiss pairings without conflicts.');
-  }
-
-  const finalPairs = solution ? [...solution] : [];
-  if (byePlayer !== null) {
-    finalPairs.push([byePlayer]);
-  }
-  return finalPairs;
 }
 
 function renderRulesPanel() {
@@ -307,7 +98,7 @@ function renderRulesPanel() {
   const description = createElement('div', { className: 'rules-list' });
 
   description.append(
-    ...rulesText.map((paragraph) => {
+    ...state.rules.map((paragraph) => {
       if (paragraph === 'Swiss-style tournaments were developed to counteract this problem. Swiss-style tournaments generally have two rules:') {
         const intro = createElement('p', { textContent: paragraph });
         const list = createElement('ul');
@@ -337,7 +128,7 @@ function renderStandingsPanel() {
     textContent: 'Generate next round',
     attrs: { type: 'button' }
   });
-  nextRoundButton.disabled = !canGenerateNextRound();
+  nextRoundButton.disabled = !state.canGenerateNextRound;
   nextRoundButton.addEventListener('click', generateNextRound);
 
   const resetButton = createElement('button', {
@@ -345,11 +136,13 @@ function renderStandingsPanel() {
     textContent: 'Reset tournament',
     attrs: { type: 'button' }
   });
-  resetButton.addEventListener('click', resetTournament);
+  resetButton.addEventListener('click', () => {
+    if (confirm('Reset the tournament to the initial seeded state?')) {
+      resetTournament().catch((error) => alert(error.message));
+    }
+  });
 
   controls.append(nextRoundButton, resetButton);
-
-  const standings = recalculateStandings();
 
   const table = createElement('table');
   const thead = createElement('thead');
@@ -360,7 +153,7 @@ function renderStandingsPanel() {
   thead.append(headerRow);
 
   const tbody = createElement('tbody');
-  standings.forEach((entry, index) => {
+  state.standings.forEach((entry, index) => {
     const row = createElement('tr');
     row.append(createElement('td', { textContent: `#${index + 1}` }));
     row.append(
@@ -377,7 +170,7 @@ function renderStandingsPanel() {
       attrs: { type: 'number', step: '0.5', value: entry.addScore }
     });
     input.addEventListener('change', (event) => {
-      handleAddScoreChange(entry.id, event.target.value);
+      handleAddScoreChange(entry.id, event.target.value).catch((error) => alert(error.message));
     });
     row.append(createElement('td', {}, input));
 
@@ -402,7 +195,7 @@ function renderStandingsPanel() {
 function renderRoundsSection() {
   const container = createElement('div', {});
 
-  state.rounds.forEach((round, roundIndex) => {
+  state.rounds.forEach((round) => {
     const completed = round.pairings.every((pairing) => pairing.result !== RESULT.UNPLAYED);
     const roundCard = createElement('div', { className: 'round-card' });
     const roundHeader = createElement('div', { className: 'round-header' });
@@ -419,7 +212,7 @@ function renderRoundsSection() {
       roundCard.append(createElement('div', { className: 'empty-state', textContent: 'No matches scheduled yet.' }));
     } else {
       round.pairings.forEach((pairing) => {
-        roundCard.append(renderMatchRow(roundIndex, pairing));
+        roundCard.append(renderMatchRow(pairing));
       });
     }
 
@@ -429,8 +222,8 @@ function renderRoundsSection() {
   return container;
 }
 
-function renderMatchRow(roundIndex, pairing) {
-  const { table, player1, player2, player1Name, player2Name, result } = pairing;
+function renderMatchRow(pairing) {
+  const { id, table, player1, player2, player1Name, player2Name, result } = pairing;
   const row = createElement('div', { className: 'match-row' });
 
   row.append(createElement('div', { className: 'table-id badge', textContent: `Table ${table}` }));
@@ -476,7 +269,10 @@ function renderMatchRow(roundIndex, pairing) {
   }
 
   select.addEventListener('change', (event) => {
-    setMatchResult(roundIndex, table, event.target.value);
+    setMatchResult(id, event.target.value).catch((error) => {
+      alert(error.message);
+      refreshState();
+    });
   });
 
   row.append(player1Block, versus, player2Block, select);
@@ -521,4 +317,15 @@ function renderApp() {
   root.append(renderRulesPanel(), renderStandingsPanel(), renderDirectoryPanel());
 }
 
-renderApp();
+function renderLoading() {
+  const root = document.getElementById('app');
+  root.innerHTML = '';
+  root.append(createElement('div', { className: 'panel', textContent: 'Loading tournament data…' }));
+}
+
+renderLoading();
+refreshState().catch((error) => {
+  const root = document.getElementById('app');
+  root.innerHTML = '';
+  root.append(createElement('div', { className: 'panel', textContent: `Failed to load tournament data: ${error.message}` }));
+});

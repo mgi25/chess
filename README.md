@@ -1,29 +1,59 @@
 # Swiss Chess League Manager
 
-This repository now ships a browser-based recreation of the original `SwissChessLeaguev4.xlsm` workbook. It keeps the same player roster, Round 1 pairings, and tournament rules while adding a modern interface for entering results and generating additional Swiss rounds.
+This repository contains a browser-based recreation of the original `SwissChessLeaguev4.xlsm` workbook along with a complementary Express/SQLite backend. The service keeps the same player roster, Round 1 pairings, and tournament rules while providing REST APIs, data persistence, and a modern interface for driving the tournament.
 
-## Getting started
+## Requirements
 
-1. Start a local static file server from the repository root. For example, with Python installed you can run:
-   ```bash
-   python -m http.server 8000
-   ```
-2. Open your browser at [http://localhost:8000](http://localhost:8000) and load `index.html`.
+- [Node.js](https://nodejs.org/) 18 or later
+- npm (ships with Node.js)
 
-No build tooling or external dependencies are required – everything runs directly in the browser.
+## Installation & database setup
 
-## Features
+From the repository root run:
 
+```bash
+npm install
+npm run migrate
+npm run seed
+```
+
+The first command installs the backend and tooling dependencies. `npm run migrate` creates the SQLite schema in `server/data/tournament.sqlite`, and `npm run seed` loads the historical player roster plus the Round 1 pairings from the workbook.
+
+## Running the application locally
+
+Start the backend API (defaults to port 4000):
+
+```bash
+npm run start:server
+```
+
+In a second terminal start the static front-end server (defaults to port 4173):
+
+```bash
+npm run start:client
+```
+
+Open [http://localhost:4173](http://localhost:4173) in your browser. The page is preconfigured to call the backend at `http://localhost:4000/api`, but you can override the base URL by setting `window.APP_API_BASE` before loading `src/app.js`.
+
+## Verifying persistence
+
+1. With both servers running, open the app and record a few match results or add manual score adjustments.
+2. Refresh the page or close and reopen the browser tab.
+3. The previously entered results and adjustments will reload from the SQLite database via the backend API, confirming that tournament state now survives page refreshes.
+
+## Available features
+
+- ✅ REST backend exposing players, rounds, matches, standings, and adjustment endpoints with Swiss pairing enforcement.
 - ✅ Rules panel reproducing the explanatory text from the `Rules` worksheet.
 - ✅ Player directory containing the full contact list from the `Matches` worksheet.
-- ✅ Standings table with live win/draw/loss tallies, manual score adjustments, and opponent history.
-- ✅ Interactive match cards for every recorded round (Round 1 pre-loaded from the workbook).
-- ✅ One-click generation of future rounds using a Swiss pairing algorithm that respects the “no rematches” constraint and uses the workbook’s random seeds as tie-breakers.
+- ✅ Standings table with live win/draw/loss tallies, manual score adjustments, opponent history, and persisted totals.
+- ✅ Interactive match cards for every recorded round with automatic bye handling.
+- ✅ One-click generation of future rounds using a Swiss pairing algorithm that reuses the workbook logic while preventing rematches.
 
-## Notes
+## Operational tips
 
-- Results are stored in-memory. Refreshing the page resets the state to match the Excel workbook.
-- When generating additional rounds, ensure all matches in the current schedule have recorded results.
-- If an odd number of players ever needs to be paired, the UI will automatically assign a bye worth 1 point.
+- Run `npm run reset` to drop all rounds/results and reseed the database back to the workbook starting state.
+- Always ensure every match in the current round has a recorded result before asking the backend to generate the next round.
+- If an odd number of players needs pairing, the backend automatically awards a bye worth 1 point and prevents players from receiving multiple byes.
 
 Enjoy running your Swiss tournaments on the web! 🏆
