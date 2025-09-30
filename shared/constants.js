@@ -1,0 +1,7 @@
+export const RESULT = {
+  UNPLAYED: 'UNPLAYED',
+  PLAYER1: 'PLAYER1',
+  PLAYER2: 'PLAYER2',
+  DRAW: 'DRAW',
+  BYE: 'BYE'
+};
