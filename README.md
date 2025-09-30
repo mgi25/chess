@@ -1,39 +1,41 @@
 # Swiss Chess League Manager
 
-This repository contains a browser-based recreation of the original `SwissChessLeaguev4.xlsm` workbook along with a complementary Express/SQLite backend. The service keeps the same player roster, Round 1 pairings, and tournament rules while providing REST APIs, data persistence, and a modern interface for driving the tournament.
+This repository contains a browser-based recreation of the original `SwissChessLeaguev4.xlsm` workbook backed by a Flask/SQLite API. The service keeps the same player roster, Round 1 pairings, and tournament rules while providing REST APIs, data persistence, and a modern interface for driving the tournament.
 
 ## Requirements
 
-- [Node.js](https://nodejs.org/) 18 or later
-- npm (ships with Node.js)
+- [Python](https://www.python.org/) 3.11 or later
+- [pip](https://pip.pypa.io/)
 
 ## Installation & database setup
 
 From the repository root run:
 
 ```bash
-npm install
-npm run migrate
-npm run seed
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+python -m backend.scripts.migrate
+python -m backend.scripts.seed
 ```
 
-The first command installs the backend and tooling dependencies. `npm run migrate` creates the SQLite schema in `server/data/tournament.sqlite`, and `npm run seed` loads the historical player roster plus the Round 1 pairings from the workbook.
+The virtual environment keeps dependencies isolated. `python -m backend.scripts.migrate` creates the SQLite schema in `backend/data/tournament.sqlite`, and `python -m backend.scripts.seed` loads the historical player roster plus the Round 1 pairings from the workbook.
 
 ## Running the application locally
 
-Start the backend API (defaults to port 4000):
+Start the backend API (defaults to port 5000):
 
 ```bash
-npm run start:server
+python -m backend.app
 ```
 
-In a second terminal start the static front-end server (defaults to port 4173):
+In a second terminal serve the static front-end (any static file server will work). For example, using Python’s built-in HTTP server:
 
 ```bash
-npm run start:client
+python -m http.server 4173
 ```
 
-Open [http://localhost:4173](http://localhost:4173) in your browser. The page is preconfigured to call the backend at `http://localhost:4000/api`, but you can override the base URL by setting `window.APP_API_BASE` before loading `src/app.js`.
+Open [http://localhost:4173](http://localhost:4173) in your browser. The page is preconfigured to call the backend at `http://localhost:5000/api`, but you can override the base URL by setting `window.APP_API_BASE` before loading `src/app.js`.
 
 ## Verifying persistence
 
@@ -52,7 +54,7 @@ Open [http://localhost:4173](http://localhost:4173) in your browser. The page is
 
 ## Operational tips
 
-- Run `npm run reset` to drop all rounds/results and reseed the database back to the workbook starting state.
+- Run `python -m backend.scripts.reset` to drop all rounds/results and reseed the database back to the workbook starting state.
 - Always ensure every match in the current round has a recorded result before asking the backend to generate the next round.
 - If an odd number of players needs pairing, the backend automatically awards a bye worth 1 point and prevents players from receiving multiple byes.
 
