@@ -1,4 +1,4 @@
-export const playerSeedData = [
+PLAYER_SEED_DATA = [
   {
     "id": 1,
     "name": "aditya dhyani",
@@ -449,9 +449,9 @@ export const playerSeedData = [
     "registerNumber": "25111249",
     "seed": 55
   }
-];
+]
 
-export const initialPairings = [
+INITIAL_PAIRINGS = [
   {
     "table": 1,
     "player1": 43,
@@ -627,4 +627,4 @@ export const initialPairings = [
     "player1Name": "Sahil Kadu",
     "player2Name": "Aditi Sai"
   }
-];
+]
